@@ -15,7 +15,67 @@ mkdir -p "${BACKUP_DIR}"
 shopt -s nullglob
 NOW=$(date +"%Y%m%d_%H%M%S")
 
-[ "$VERBOSE" = true ] && echo "Fetching forked repositories for organization: ${GITHUB_ORG}"
+# Helper function: log messages with different log levels
+log_info()    { echo "[INFO] $*" >&2; }
+log_verbose() { [ "$VERBOSE" = true ] && echo "[VERBOSE] $*" >&2; }
+log_warn()    { echo "[WARN] $*" >&2; }
+log_error()   { echo "[ERROR] $*" >&2; }
+
+# Helper function: makes a GitHub API call, captures rate-limit headers, and sleeps if we are near or at the limit.
+call_github_api() {
+    local method="$1"      # e.g., GET, POST, PATCH, etc.
+    local url="$2"
+    local data="${3:-}"    # JSON body if needed, otherwise empty
+
+    local temp_headers
+    local temp_body
+    temp_headers=$(mktemp)
+    temp_body=$(mktemp)
+
+    log_verbose "Making $method request to $url"
+    [ -n "$data" ] && log_verbose "Request body: $data"
+
+    curl -s -D "$temp_headers" -X "$method" \
+         -H "Authorization: token ${GITHUB_TOKEN}" \
+         -H "Content-Type: application/json" \
+         ${data:+ -d "$data"} \
+         "$url" > "$temp_body"
+
+    # Extract rate-limit info from headers
+    local remaining
+    local reset
+    remaining=$(grep -i '^X-RateLimit-Remaining:' "$temp_headers" | awk '{print $2}' | tr -d '\r')
+    reset=$(grep -i '^X-RateLimit-Reset:' "$temp_headers" | awk '{print $2}' | tr -d '\r')
+    log_verbose "X-RateLimit-Remaining: $remaining"
+    log_verbose "X-RateLimit-Reset:     $reset"
+
+    # Check if near or at the rate limit, if less than or equal to 5, sleep until reset time.
+    if [ -n "$remaining" ] && [ -n "$reset" ]; then
+        if [ "$remaining" -le 5 ]; then
+            local current_time
+            current_time=$(date +%s)
+            local sleep_duration=$(( reset - current_time ))
+            if [ "$sleep_duration" -gt 0 ]; then
+                log_warn "Rate limit reached or nearly reached. Sleeping for $sleep_duration seconds..."
+                sleep "$sleep_duration"
+            fi
+        fi
+    fi
+
+    cat "$temp_body"
+    rm -f "$temp_headers" "$temp_body"
+}
+
+forks_processed=0
+forks_updated=0
+backups_created=0
+backups_deleted=0
+
+######################################
+# Main script logic
+######################################
+
+log_verbose "Fetching forked repositories for organization: ${GITHUB_ORG}"
 
 # Get all forked repos along with their default branch
 FORKED_REPOS=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" \
@@ -29,74 +89,87 @@ fi
 
 # Loop through each forked repo to update, backup (if needed), and update its description
 while read -r repo default_branch; do
-    if [ "$VERBOSE" = true ]; then
-        echo "----------------------------------------"
-        echo "Processing repository: ${repo}"
-        echo "Default branch: ${default_branch}"
-    fi
+    forks_processed=$((forks_processed + 1))
+    log_verbose "----------------------------------------"
+    log_verbose "Processing repository: ${repo}"
+    log_verbose "Default branch: ${default_branch}"
 
-    echo "Updating fork for ${repo}..."
-    update_response=$(curl -s -X POST \
-        -H "Authorization: token ${GITHUB_TOKEN}" \
-        -H "Content-Type: application/json" \
-        -d "{\"branch\": \"${default_branch}\"}" \
-        "https://api.github.com/repos/${GITHUB_ORG}/${repo}/merge-upstream")
-    if [ "$VERBOSE" = true ]; then
-        echo "Fork update response for ${repo}: ${update_response}"
-    fi
+    log_info "Updating fork for ${repo}..."
+    update_response=$(call_github_api "POST" \
+        "https://api.github.com/repos/${GITHUB_ORG}/${repo}/merge-upstream" \
+        "{\"branch\": \"${default_branch}\"}")
+
+    log_verbose "Fork update response for ${repo}: ${update_response}"
 
     # Get the merge_type from the response (if any)
     merge_type=$(echo "$update_response" | jq -r '.merge_type // empty')
+    if [ "$merge_type" = "fast-forward" ]; then
+        forks_updated=$((forks_updated + 1))
+        log_verbose "Repo ${repo} had new commits. (merge_type: fast-forward)"
+    else
+        log_verbose "Repo ${repo} had no new commits. (merge_type: $merge_type)"
+    fi
 
     # Count existing backups for this repo using globbing
     backup_files=("${BACKUP_DIR}/${repo}"_*.zip)
     existing_backup_count=${#backup_files[@]}
+    log_verbose "Found $existing_backup_count existing backup(s) for repo: ${repo}"
 
+    need_backup=false
     if [ "$CHECK_FOR_CHANGES" = true ]; then
         # Only backup if new changes were merged OR no backup exists locally
         if [ "$merge_type" == "fast-forward" ] || [ "$existing_backup_count" -eq 0 ]; then
-            echo "Creating backup for ${repo}..."
-        else
-            echo "No new changes for ${repo} and backup already exists locally. Skipping backup."
-            continue
+            need_backup=true
         fi
     else
-        echo "Creating backup for ${repo}..."
+        need_backup=true
     fi
 
     # Create the backup (zip archive) for the default branch
-    zip_url="https://api.github.com/repos/${GITHUB_ORG}/${repo}/zipball/${default_branch}"
-    backup_file="${BACKUP_DIR}/${repo}_${NOW}.zip"
-    curl -L -s -H "Authorization: token ${GITHUB_TOKEN}" -o "${backup_file}" "${zip_url}"
-    echo "Backup created: ${backup_file}"
+    if [ "$need_backup" = true ]; then
+        log_info "Creating backup for ${repo}..."
+        zip_url="https://api.github.com/repos/${GITHUB_ORG}/${repo}/zipball/${default_branch}"
+        backup_file="${BACKUP_DIR}/${repo}_${NOW}.zip"
+
+        call_github_api "GET" "$zip_url" "" > "${backup_file}"
+        log_info "Backup created: ${backup_file}"
+        backups_created=$((backups_created + 1))
+    else
+        log_info "No backup created for ${repo}."
+    fi
 
     # Remove old backups if exceeding MAX_BACKUPS
     backup_files=("${BACKUP_DIR}/${repo}"_*.zip)
     backup_count=${#backup_files[@]}
     if [ "$backup_count" -gt "$MAX_BACKUPS" ]; then
-        [ "$VERBOSE" = true ] && echo "Cleaning up old backups for ${repo}..."
+        log_verbose "Cleaning up old backups for ${repo}..."
         # Remove the oldest backups first
-        files_to_remove=$(ls -1tr "${BACKUP_DIR}/${repo}"_*.zip | head -n $(($backup_count - MAX_BACKUPS)))
+        files_to_remove=$(ls -1tr "${BACKUP_DIR}/${repo}"_*.zip | head -n $((backup_count - MAX_BACKUPS)))
         for old_file in $files_to_remove; do
             rm "$old_file"
-            [ "$VERBOSE" = true ] && echo "Removed old backup: ${old_file}"
+            log_verbose "Removed old backup: ${old_file}"
+            backups_deleted=$((backups_deleted + 1))
         done
     fi
 
     # Update the repository description with the latest sync time
     LAST_SYNC=$(date +"%Y-%m-%d %H:%M:%S")
     NEW_DESCRIPTION="This repository is automatically synced with the original repository. Last sync: ${LAST_SYNC}"
-    echo "Updating description for ${repo} with: ${NEW_DESCRIPTION}"
+    log_verbose "Updating description for ${repo}: ${NEW_DESCRIPTION}"
     json_payload=$(jq -n --arg desc "$NEW_DESCRIPTION" '{description: $desc}')
-    update_desc_response=$(curl -s -X PATCH \
-        -H "Authorization: token ${GITHUB_TOKEN}" \
-        -H "Content-Type: application/json" \
-        -d "$json_payload" \
-        "https://api.github.com/repos/${GITHUB_ORG}/${repo}")
-    if [ "$VERBOSE" = true ]; then
-        echo "Update repository description response for ${repo}: ${update_desc_response}"
-    fi
+
+    update_desc_response=$(call_github_api "PATCH" \
+        "https://api.github.com/repos/${GITHUB_ORG}/${repo}" \
+        "$json_payload")
+
+    log_verbose "Update repository description response for ${repo}: ${update_desc_response}"
 
 done <<< "$FORKED_REPOS"
 
-echo "Backup process completed."
+log_info "Backup process completed."
+log_info "----------------------------------------"
+log_info "Summary:"
+log_info "  * Forks processed:   $forks_processed"
+log_info "  * Forks updated:     $forks_updated"
+log_info "  * Backups created:   $backups_created"
+log_info "  * Backups deleted:   $backups_deleted"
