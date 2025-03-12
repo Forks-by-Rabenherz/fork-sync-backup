@@ -25,7 +25,7 @@
 ## ⚙️ Requirements
 
 - **Bash:** Compatible with Unix-like systems
-- **jq:** A lightweight command-line JSON processor
+- **Grep:** A command-line utility for searching plain-text data
   Install via your package manager (e.g., `sudo apt install jq` or `brew install jq`)
 - **curl:** For interacting with the GitHub API
   Install via your package manager (e.g., `sudo apt install curl` or `brew install curl`)
