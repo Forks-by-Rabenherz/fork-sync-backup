@@ -56,12 +56,13 @@
 Open `backup_forks.sh` in your favorite text editor and configure the following variables at the top:
 
 ```bash
-GITHUB_ORG="your_org_here"          # Your GitHub organization name
-GITHUB_TOKEN="your_token_here"      # GitHub Personal Access Token with necessary permissions
-BACKUP_DIR="/path/to/backup_dir"      # Local directory to store backup zip files
-MAX_BACKUPS=30                      # Maximum number of backups to retain per repository
-VERBOSE=false                       # Set to "true" for detailed output, "false" for minimal output
-CHECK_FOR_CHANGES=true              # Set to "true" to only backup when new changes exist (or no backup exists), "false" to always backup.
+GITHUB_ORG="your_org_here"          # Your GitHub organization name (e.g., "Forks-by-Rabenherz")
+GITHUB_TOKEN="your_token_here"      # GitHub Personal Access Token with necessary permissions (Fine-grained permissions: "administration, code, commit statuses"
+BACKUP_DIR="/path/to/backup_dir"    # Local directory to store backup zip files (e.g., "./backups" or "/tmp/backups")
+MAX_BACKUPS=30                      # Maximum number of backups to retain per repository (older backups will be deleted)
+CHECK_FOR_CHANGES=true              # Set to "true" to check for changes before taking a backup, "false" to always take a backup
+REMOVE_UNFORKED_BACKUPS=false       # Set to "true" to remove backups for repositories that are no longer forked, "false" to keep them
+VERBOSE=false                       # Set to "true" for detailed output, "false" for minimal output (this is used for debugging)
 ```
 
 ## 🚀 Usage
