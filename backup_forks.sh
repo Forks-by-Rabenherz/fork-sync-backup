@@ -11,7 +11,7 @@ MAX_BACKUPS=30                      # Maximum number of backups to retain per re
 CHECK_FOR_CHANGES=true              # Set to "true" to check for changes before taking a backup, "false" to always take a backup
 REMOVE_UNFORKED_BACKUPS=false       # Set to "true" to remove backups for repositories that are no longer forked, "false" to keep them
 VERBOSE=false                       # Set to "true" for detailed output, "false" for minimal output (this is used for debugging)
-LOG_PATH="/var/logs"                         # If non-empty, log messages will be written to this file (e.g., "/path/to/script.log")
+LOG_PATH="/var/logs"                # If non-empty, log messages will be written to this file (e.g., "/path/to/script.log")
 LOG_MAX_SIZE_MB=10                  # Maximum log file size (in MB) before rotation occurs
 MAX_LOG_ZIPS=3                      # Maximum number of rotated (zipped) logs to keep
 
