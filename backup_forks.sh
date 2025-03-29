@@ -11,6 +11,9 @@ MAX_BACKUPS=30                      # Maximum number of backups to retain per re
 CHECK_FOR_CHANGES=true              # Set to "true" to check for changes before taking a backup, "false" to always take a backup
 REMOVE_UNFORKED_BACKUPS=false       # Set to "true" to remove backups for repositories that are no longer forked, "false" to keep them
 VERBOSE=false                       # Set to "true" for detailed output, "false" for minimal output (this is used for debugging)
+LOG_PATH="/var/logs"                         # If non-empty, log messages will be written to this file (e.g., "/path/to/script.log")
+LOG_MAX_SIZE_MB=10                  # Maximum log file size (in MB) before rotation occurs
+MAX_LOG_ZIPS=3                      # Maximum number of rotated (zipped) logs to keep
 
 mkdir -p "${BACKUP_DIR}"
 shopt -s nullglob
@@ -18,11 +21,73 @@ NOW=$(date +"%Y%m%d_%H%M%S")
 START_TIME=$(date +%s)
 START_SIZE=$(du -sb "${BACKUP_DIR}" 2>/dev/null | cut -f1 || echo 0)
 
+if [ -n "${LOG_PATH}" ]; then
+    if [[ "$LOG_PATH" != */BackupForks.log ]]; then
+        LOG_FILE="${LOG_PATH%/}/BackupForks.log"
+    else
+        LOG_FILE="$LOG_PATH"
+    fi
+    mkdir -p "$(dirname "$LOG_FILE")"
+else
+    LOG_FILE=""
+fi
+
+# Helper function: log rotation
+rotate_log_if_needed() {
+    if [ -n "${LOG_FILE:-}" ] && [ -f "$LOG_FILE" ]; then
+        local max_bytes=$(( LOG_MAX_SIZE_MB * 1024 * 1024 ))
+        local filesize
+        filesize=$(stat -c%s "$LOG_FILE")
+        if [ "$filesize" -ge "$max_bytes" ]; then
+            local ts
+            ts=$(date +"%Y%m%d_%H%M%S")
+            local rotated_log="${LOG_FILE}_${ts}.tar.gz"
+            # Compress the log file using tar with gzip compression
+            tar -czf "$rotated_log" -C "$(dirname "$LOG_FILE")" "$(basename "$LOG_FILE")"
+            # Clear the current log file
+            : > "$LOG_FILE"
+            # Remove old rotated logs if more than MAX_LOG_ZIPS exist
+            local rotated_files
+            mapfile -t rotated_files < <(ls -1tr "${LOG_FILE}"_*.tar.gz 2>/dev/null || true)
+            local count=${#rotated_files[@]}
+            if [ "$count" -gt "$MAX_LOG_ZIPS" ]; then
+                local num_to_delete=$(( count - MAX_LOG_ZIPS ))
+                for old_log in $(ls -1tr "${LOG_FILE}"_*.tar.gz | head -n "$num_to_delete"); do
+                    rm -f "$old_log"
+                done
+            fi
+        fi
+    fi
+}
+
 # Helper function: log messages with different log levels
-log_info()    { echo "[INFO] $*" >&2; }
-log_verbose() { [ "$VERBOSE" = true ] && echo "[VERBOSE] $*" >&2 || true; }
-log_warn()    { echo "[WARN] $*" >&2; }
-log_error()   { echo "[ERROR] $*" >&2; }
+log_to_file() {
+    if [ -n "${LOG_FILE:-}" ]; then
+        echo "$(date +"%Y-%m-%d %H:%M:%S") $1" >> "$LOG_FILE"
+    fi
+}
+log_info() {
+    local message="[INFO] $*"
+    echo "$message" >&2
+    log_to_file "$message"
+}
+log_verbose() {
+    if [ "$VERBOSE" = true ]; then
+        local message="[VERBOSE] $*"
+        echo "$message" >&2
+        log_to_file "$message"
+    fi
+}
+log_warn() {
+    local message="[WARN] $*"
+    echo "$message" >&2
+    log_to_file "$message"
+}
+log_error() {
+    local message="[ERROR] $*"
+    echo "$message" >&2
+    log_to_file "$message"
+}
 
 # Helper function: makes a GitHub API call, captures rate-limit headers, and sleeps if we are near or at the limit.
 call_github_api() {
@@ -95,6 +160,10 @@ backups_deleted=0
 ######################################
 # Main script logic
 ######################################
+
+if [ -n "${LOG_FILE:-}" ]; then
+    rotate_log_if_needed
+fi
 
 log_verbose "Fetching forked repositories for organization: ${GITHUB_ORG}"
 
