@@ -10,6 +10,7 @@ BACKUP_DIR="/path/to/backup_dir"    # Local directory to store backup zip files 
 MAX_BACKUPS=30                      # Maximum number of backups to retain per repository (older backups will be deleted)
 CHECK_FOR_CHANGES=true              # Set to "true" to check for changes before taking a backup, "false" to always take a backup
 REMOVE_UNFORKED_BACKUPS=false       # Set to "true" to remove backups for repositories that are no longer forked, "false" to keep them
+SET_GITHUB_ORG_STATS=false          # Set to "true" to check and set in the .github repository the current stats
 VERBOSE=false                       # Set to "true" for detailed output, "false" for minimal output (this is used for debugging)
 LOG_PATH="/var/logs"                # If non-empty, log messages will be written to this file (e.g., "/path/to/script.log")
 LOG_MAX_SIZE_MB=10                  # Maximum log file size (in MB) before rotation occurs
@@ -324,5 +325,138 @@ log_info "  * Backup directory:  $BACKUP_DIR"
 log_info "  * Max backups:       $MAX_BACKUPS"
 log_info "  * Disk changes:      $SIZE_DIFF_FORMAT"
 log_info "----------------------------------------"
+
+# Update GitHub organization stats if enabled
+if [ "${SET_GITHUB_ORG_STATS}" = "true" ]; then
+    log_info "Checking for .github repository to update stats..."
+    
+    # Check if .github repo exists
+    github_repo_response=$(call_github_api "GET" \
+        "https://api.github.com/repos/${GITHUB_ORG}/.github" 2>/dev/null || echo "")
+    
+    if [ -z "$github_repo_response" ] || echo "$github_repo_response" | jq -e '.message' >/dev/null 2>&1; then
+        log_verbose ".github repository does not exist or is not accessible."
+    else
+        log_verbose ".github repository exists."
+        
+        # Get the default branch
+        default_branch=$(echo "$github_repo_response" | jq -r '.default_branch // "main"')
+        log_verbose "Default branch for .github repo: ${default_branch}"
+        
+        # Check if profile/README.md exists
+        readme_response=$(call_github_api "GET" \
+            "https://api.github.com/repos/${GITHUB_ORG}/.github/contents/profile/README.md?ref=${default_branch}" 2>/dev/null || echo "")
+        
+        if [ -z "$readme_response" ] || echo "$readme_response" | jq -e '.message' >/dev/null 2>&1; then
+            log_verbose "profile/README.md does not exist in .github repository."
+        else
+            log_verbose "profile/README.md exists."
+            
+            # Get the file SHA and content
+            file_sha=$(echo "$readme_response" | jq -r '.sha')
+            file_content_encoded=$(echo "$readme_response" | jq -r '.content // ""')
+            
+            if [ -z "$file_content_encoded" ] || [ "$file_content_encoded" = "null" ]; then
+                log_warn "Could not retrieve content from profile/README.md"
+            else
+                # Decode base64 content (remove newlines from base64 string first)
+                file_content=$(echo "$file_content_encoded" | tr -d '\n' | base64 -d 2>/dev/null || echo "")
+                
+                if [ -z "$file_content" ]; then
+                    log_warn "Could not decode content from profile/README.md"
+                else
+                    # Check for markers
+                    if echo "$file_content" | grep -q "<!-- MARKER:STATS-START -->" && \
+                       echo "$file_content" | grep -q "<!-- MARKER:STATS-END -->"; then
+                        log_verbose "Found stats markers in profile/README.md"
+                        
+                        # Create temporary file for content manipulation
+                        temp_file=$(mktemp)
+                        echo "$file_content" > "$temp_file"
+                        
+                        # Calculate total disk space used for backups
+                        TOTAL_DISK_SPACE_HUMAN=$(human_readable_size "$END_SIZE")
+                        
+                        # Count total backups stored
+                        total_backups_stored=0
+                        for backup_file in "${BACKUP_DIR}"/*.zip; do
+                            [ -e "$backup_file" ] || break  # no .zip files exist
+                            total_backups_stored=$((total_backups_stored + 1))
+                        done
+                        
+                        # Generate stats content
+                        stats_temp=$(mktemp)
+                        cat > "$stats_temp" <<EOF
+<!-- MARKER:STATS-START -->
+
+- **Forks processed:**   $forks_processed
+- **Forks updated:**     $forks_updated
+- **Total backups stored:**   $total_backups_stored
+- **Last run duration:**          ${DURATION_MMSS}
+- **Total disk usage:**  $TOTAL_DISK_SPACE_HUMAN
+- **Last run disk changes:**      $SIZE_DIFF_FORMAT
+- **Last updated:**      $(date +"%Y-%m-%d %H:%M:%S")
+
+<!-- MARKER:STATS-END -->
+EOF
+                        
+                        # Replace content between markers
+                        # First, find the line numbers of the markers
+                        start_line=$(grep -n "<!-- MARKER:STATS-START -->" "$temp_file" | cut -d: -f1)
+                        end_line=$(grep -n "<!-- MARKER:STATS-END -->" "$temp_file" | cut -d: -f1)
+                        
+                        if [ -n "$start_line" ] && [ -n "$end_line" ] && [ "$start_line" -lt "$end_line" ]; then
+                            # Create new file: content before start marker + stats + content after end marker
+                            new_content_temp=$(mktemp)
+                            
+                            # Get content before start marker (excluding the start marker line)
+                            head -n "$((start_line - 1))" "$temp_file" > "$new_content_temp"
+                            
+                            # Add the new stats content (which includes both markers)
+                            cat "$stats_temp" >> "$new_content_temp"
+                            
+                            # Get content after end marker (excluding the end marker line)
+                            tail -n +$((end_line + 1)) "$temp_file" >> "$new_content_temp"
+                            
+                            # Read the new content
+                            new_content=$(cat "$new_content_temp")
+                            
+                            # Clean up temp files
+                            rm -f "$temp_file" "$stats_temp" "$new_content_temp"
+                            
+                            # Encode the new content to base64
+                            new_content_encoded=$(echo -n "$new_content" | base64 | tr -d '\n')
+                            
+                            # Update the file via GitHub API
+                            commit_message="Update organization statistics - $(date +"%Y-%m-%d %H:%M:%S")"
+                            json_payload=$(jq -n \
+                                --arg message "$commit_message" \
+                                --arg content "$new_content_encoded" \
+                                --arg sha "$file_sha" \
+                                --arg branch "$default_branch" \
+                                '{message: $message, content: $content, sha: $sha, branch: $branch}')
+                            
+                            update_response=$(call_github_api "PUT" \
+                                "https://api.github.com/repos/${GITHUB_ORG}/.github/contents/profile/README.md" \
+                                "$json_payload")
+                            
+                            if echo "$update_response" | jq -e '.content' >/dev/null 2>&1; then
+                                log_info "Successfully updated organization stats in .github repository."
+                            else
+                                log_error "Failed to update organization stats: $update_response"
+                            fi
+                        else
+                            log_warn "Could not find valid stats markers in profile/README.md (start_line: ${start_line}, end_line: ${end_line})"
+                            # Clean up temp files
+                            rm -f "$temp_file" "$stats_temp"
+                        fi
+                    else
+                        log_verbose "Stats markers not found in profile/README.md"
+                    fi
+                fi
+            fi
+        fi
+    fi
+fi
 
 exit 0
